@@ -3,16 +3,15 @@ package rpc
 import (
 	"errors"
 	"fmt"
-	"net"
-	"regexp"
-	"sort"
-
 	hadoop "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
 	"github.com/colinmarc/hdfs/v2/internal/sasl"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
 	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
 	"github.com/jcmturner/gokrb5/v8/spnego"
 	krbtypes "github.com/jcmturner/gokrb5/v8/types"
+	"net"
+	"regexp"
+	"sort"
 )
 
 const saslRpcCallId = -33
@@ -100,26 +99,17 @@ func (c *NamenodeConnection) doKerberosHandshake() error {
 		return err
 	}
 
-	var nnToken gssapi.WrapToken
-	err = nnToken.Unmarshal(resp.GetToken(), true)
-	if err != nil {
-		return err
-	}
+	tokenFromResp := resp.GetToken()
 
-	_, err = nnToken.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SEAL)
-	if err != nil {
-		return fmt.Errorf("invalid server token: %s", err)
-	}
+	var signedBytes []byte
 
-	// Sign the payload and send it back to the namenode.
-	// TODO: Make sure we can support what is required based on what's in the
-	// payload.
-	signed, err := gssapi.NewInitiatorWrapToken(nnToken.Payload, sessionKey)
-	if err != nil {
-		return err
+	// RFC 4121 Section.6
+	// https://datatracker.ietf.org/doc/rfc4121/
+	if tokenFromResp[0] == 0x60 {
+		signedBytes, err = getInitiatorWrapTokenV1(tokenFromResp, sessionKey)
+	} else {
+		signedBytes, err = getInitiatorWrapTokenV2(tokenFromResp, sessionKey)
 	}
-
-	signedBytes, err := signed.Marshal()
 	if err != nil {
 		return err
 	}
@@ -194,4 +184,55 @@ func replaceSPNHostWildcard(spn, host string) string {
 	}
 
 	return spn[:res[2]] + host + spn[res[3]:]
+}
+
+func getInitiatorWrapTokenV1(initialToken []byte, sessionKey krbtypes.EncryptionKey) (signedToken []byte, err error) {
+	var nnTokenV1 gssapi.WrapTokenV1
+	err = nnTokenV1.Unmarshal(initialToken, true)
+	if err != nil {
+		return nil, err
+	}
+	_, err = nnTokenV1.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SIGN)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server token (v1): %s", err)
+	}
+
+	signed, err := gssapi.NewInitiatorWrapTokenV1(&nnTokenV1, sessionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	signedBytes, err := signed.Marshal(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return signedBytes, nil
+}
+
+func getInitiatorWrapTokenV2(initialToken []byte, sessionKey krbtypes.EncryptionKey) (signedToken []byte, err error) {
+	var nnToken gssapi.WrapToken
+
+	err = nnToken.Unmarshal(initialToken, true)
+	if err != nil {
+		return nil, err
+	}
+	_, err = nnToken.Verify(sessionKey, keyusage.GSSAPI_ACCEPTOR_SEAL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server token: %s", err)
+	}
+	// Sign the payload and send it back to the namenode.
+	// TODO: Make sure we can support what is required based on what's in the
+	// payload.
+	signed, err := gssapi.NewInitiatorWrapToken(nnToken.Payload, sessionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	signedBytes, err := signed.Marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	return signedBytes, nil
 }
